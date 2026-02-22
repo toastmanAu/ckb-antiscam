@@ -171,21 +171,26 @@ function nameSimilarityScore(name) {
     const norm = name.toLowerCase().trim();
 
     for (const mod of MODS) {
-        const modName = mod.name.toLowerCase().trim();
-        const dist = Levenshtein.get(norm, modName);
+        // Build all name variants to check against
+        const nameVariants = [mod.name, ...(mod.aliases || [])];
 
-        // Also check if name CONTAINS the mod name (e.g. "Phill | Admin")
-        const contains = norm.includes(modName) || modName.includes(norm);
+        for (const variant of nameVariants) {
+            const modName = variant.toLowerCase().trim();
+            const dist = Levenshtein.get(norm, modName);
 
-        if (dist <= NAME_DIST_THRESHOLD || (contains && norm !== modName)) {
-            return {
-                suspicious: true,
-                matchedMod: mod.name,
-                distance: dist,
-                reason: dist <= NAME_DIST_THRESHOLD
-                    ? `Name "${name}" is ${dist} edit(s) from mod "${mod.name}"`
-                    : `Name "${name}" contains/matches mod name "${mod.name}"`,
-            };
+            // Also check if name CONTAINS the mod name (e.g. "Phill | Admin")
+            const contains = norm.includes(modName) || modName.includes(norm);
+
+            if (dist <= NAME_DIST_THRESHOLD || (contains && norm !== modName)) {
+                return {
+                    suspicious: true,
+                    matchedMod: mod.name,
+                    distance: dist,
+                    reason: dist <= NAME_DIST_THRESHOLD
+                        ? `Name "${name}" is ${dist} edit(s) from mod "${variant}"`
+                        : `Name "${name}" contains/matches mod name "${variant}"`,
+                };
+            }
         }
 
         // Check username similarly
