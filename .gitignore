@@ -1,0 +1,6 @@
+node_modules/
+config.json
+ban-log.json
+photo-cache/
+*.log
+*.pid

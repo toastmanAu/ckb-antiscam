@@ -1,0 +1,20 @@
+{
+  "name": "ckb-antiscam",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "axios": "^1.13.5",
+    "fast-levenshtein": "^3.0.0",
+    "jimp": "^1.6.0",
+    "node-telegram-bot-api": "^0.67.0",
+    "sharp": "^0.34.5"
+  }
+}

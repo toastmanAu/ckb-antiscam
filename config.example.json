@@ -1,0 +1,17 @@
+{
+  "bot_token": "YOUR_BOT_TOKEN",
+  "chat_id": "-1001338982855",
+  "alert_chat": "-1001338982855",
+
+  "mods": [
+    {
+      "name": "Phill",
+      "username": "toastmanAu",
+      "user_id": 1790655432
+    }
+  ],
+
+  "name_dist_threshold": 2,
+  "photo_hash_threshold": 10,
+  "warn_first": true
+}
