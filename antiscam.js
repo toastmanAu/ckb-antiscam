@@ -42,6 +42,7 @@ const CHAT_ID     = String(config.chat_id);
 const ALERT_CHAT  = String(config.alert_chat || config.chat_id);
 const MODS        = config.mods || [];
 const WARN_FIRST  = config.warn_first !== false;
+const DRY_RUN     = config.dry_run === true;   // log-only mode, no bans/deletes
 const NAME_THRESH = config.name_dist_threshold  || 2;
 const PHOTO_THRESH= config.photo_hash_threshold || 10;
 
@@ -277,6 +278,11 @@ async function checkUser(userId, firstName, lastName, username) {
 // ─── Actions ──────────────────────────────────────────────────────────────────
 
 async function banUser(userId, username, reason, trigger) {
+    if (DRY_RUN) {
+        log('DRY-RUN', `Would ban ${userId} (@${username})`, { reason, trigger });
+        appendBanLog({ userId, username, reason, trigger, dry_run: true });
+        return;
+    }
     try {
         await tgApi('banChatMember', { chat_id: CHAT_ID, user_id: userId });
         log('BAN', `Banned ${userId} (@${username})`, { reason });
@@ -293,6 +299,7 @@ async function banUser(userId, username, reason, trigger) {
 }
 
 async function deleteMsg(chatId, messageId) {
+    if (DRY_RUN) { log('DRY-RUN', `Would delete message ${messageId}`); return; }
     try { await tgApi('deleteMessage', { chat_id: chatId, message_id: messageId }); }
     catch (e) { log('WARN', 'Delete failed', { messageId, err: e.message }); }
 }
@@ -498,6 +505,7 @@ async function main() {
     }, 6 * 60 * 60 * 1000);
 
     log('INFO', '✅ Polling for updates...');
+    if (DRY_RUN) log('INFO', '⚠️  DRY-RUN MODE — logging only, no bans or deletes');
 
     // Long-polling loop
     while (true) {
