@@ -1,55 +1,54 @@
 /**
- * CKB Anti-Scam Bot
+ * CKB Anti-Scam Bot — @Wyltek_PoPo_Bot
  * Protects the @NervosUnofficial Telegram group from fake moderator scams.
  *
  * Detection vectors:
- *   1. Name similarity — Levenshtein distance ≤ 2 from any real mod name
- *   2. Profile photo similarity — perceptual hash comparison (phash)
- *   3. DM-baiting messages — pattern matching for "dm me", "contact me privately" etc.
+ *   1. Name similarity  — Levenshtein ≤ 2 edits from any real mod name/alias
+ *   2. Profile photo    — perceptual hash similarity (hamming ≤ 10)
+ *   3. DM-bait messages — regex patterns on all messages
+ *   4. Admin claims     — "I am the official mod" style claims
  *
- * Actions:
- *   - Scam JOIN: ban + delete join message + alert admins
- *   - Scam MESSAGE: delete + ban + alert admins (configurable: warn-first mode)
- *   - All bans logged to ban-log.json
- *
- * Requirements:
- *   - Bot must be an admin with: Ban users, Delete messages, Restrict members
- *   - config.json must list real mod usernames and their Telegram user IDs
+ * Uses raw https module (no node-telegram-bot-api) for compatibility.
  */
 
 'use strict';
 
-const TelegramBot = require('node-telegram-bot-api');
+// Force IPv4 DNS resolution — Telegram IPv6 unreachable from this host
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
+const https = require('https');
+const http  = require('http');
+const fs    = require('fs');
+const path  = require('path');
 const Levenshtein = require('fast-levenshtein');
-const sharp       = require('sharp');
-const axios       = require('axios');
-const fs          = require('fs');
-const path        = require('path');
+const sharp = require('sharp');
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
 
-const CONFIG_PATH  = path.join(__dirname, 'config.json');
-const BANLOG_PATH  = path.join(__dirname, 'ban-log.json');
-const CACHE_DIR    = path.join(__dirname, 'photo-cache');
+const CONFIG_PATH = path.join(__dirname, 'config.json');
+const BANLOG_PATH = path.join(__dirname, 'ban-log.json');
+const CACHE_DIR   = path.join(__dirname, 'photo-cache');
 
 if (!fs.existsSync(CONFIG_PATH)) {
-    console.error('❌ config.json not found. Copy config.example.json and fill it in.');
+    console.error('❌ config.json not found.');
     process.exit(1);
 }
 
 const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
 
 const BOT_TOKEN   = config.bot_token;
-const CHAT_ID     = config.chat_id;     // e.g. -1001338982855
-const ALERT_CHAT  = config.alert_chat || config.chat_id; // where to send ban alerts
-const MODS        = config.mods;        // array of { name, username, user_id }
-const WARN_FIRST  = config.warn_first !== false; // default true: warn before ban on messages
+const CHAT_ID     = String(config.chat_id);
+const ALERT_CHAT  = String(config.alert_chat || config.chat_id);
+const MODS        = config.mods || [];
+const WARN_FIRST  = config.warn_first !== false;
+const NAME_THRESH = config.name_dist_threshold  || 2;
+const PHOTO_THRESH= config.photo_hash_threshold || 10;
 
-// Similarity thresholds
-const NAME_DIST_THRESHOLD  = config.name_dist_threshold  || 2;   // Levenshtein ≤ 2
-const PHOTO_HASH_THRESHOLD = config.photo_hash_threshold || 10;  // hamming ≤ 10 = similar
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-// DM-baiting patterns (case-insensitive)
+// ─── DM-bait patterns ─────────────────────────────────────────────────────────
+
 const DM_BAIT_PATTERNS = [
     /\bdm\s*me\b/i,
     /\bpm\s*me\b/i,
@@ -58,31 +57,32 @@ const DM_BAIT_PATTERNS = [
     /message\s*me\s*(privately|in private|in dm)/i,
     /reach\s*me\s*(in|via|through)\s*(dm|private)/i,
     /\bprivate\s*message\s*me\b/i,
-    /write\s*to\s*me\s*(directly|privately|in dm)/i,
+    /write\s*to\s*me\s*(directly|privately)/i,
     /contact\s*me\s*for\s*(support|help|assistance)/i,
     /\bi.*official.*admin\b/i,
-    /\bi.*mod(erator)?\b.*\bhelp\b/i,
     /\bofficially\s*(contact|support)\b/i,
 ];
 
-// ─── Setup ───────────────────────────────────────────────────────────────────
+const ADMIN_CLAIM_PATTERNS = [
+    /\bi('?m| am)\s+(a\s+)?(mod|moderator|admin|official|team)\b/i,
+    /\bofficial\s+(team|support|moderator|admin)\b/i,
+    /\bnervos\s+(official|support|admin|mod)\b/i,
+    /\bckb\s+(official|support|admin|mod)\b/i,
+];
 
-if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+// ─── State ────────────────────────────────────────────────────────────────────
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
-// In-memory warn tracker { userId: warnCount }
-const warnings = new Map();
-// Known good users (admins + confirmed mods) - populated at startup
-const confirmedMods = new Set();
-// Photo hashes of real mods { userId: phash }
-const modPhotoHashes = new Map();
+const confirmedMods  = new Set(MODS.map(m => m.user_id));
+const modPhotoHashes = new Map();  // userId → BigInt hash
+const warnings       = new Map();  // userId → warn count
+let   lastUpdateId   = 0;
 
 // ─── Logging ─────────────────────────────────────────────────────────────────
 
-function log(level, msg, data = {}) {
+function log(level, msg, data) {
     const ts = new Date().toISOString();
-    console.log(`[${ts}] [${level}] ${msg}`, Object.keys(data).length ? data : '');
+    const extra = data ? ' ' + JSON.stringify(data) : '';
+    console.log(`[${ts}] [${level}] ${msg}${extra}`);
 }
 
 function appendBanLog(entry) {
@@ -94,17 +94,64 @@ function appendBanLog(entry) {
     fs.writeFileSync(BANLOG_PATH, JSON.stringify(banLog, null, 2));
 }
 
-// ─── Perceptual Hash (pHash) ──────────────────────────────────────────────────
-// Simple 8x8 DCT-based pHash in pure Node — no native deps beyond sharp.
+// ─── HTTP helper ──────────────────────────────────────────────────────────────
 
-async function computePhash(imageBuffer) {
-    // Resize to 32x32 greyscale, then 8x8 average hash (fast, good enough)
-    const pixels = await sharp(imageBuffer)
+function httpsGet(url) {
+    return new Promise((resolve, reject) => {
+        const isHttps = url.startsWith('https');
+        const mod = isHttps ? https : http;
+        mod.get(url, { timeout: 10000 }, (res) => {
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => resolve(Buffer.concat(chunks)));
+            res.on('error', reject);
+        }).on('error', reject).on('timeout', () => reject(new Error('timeout')));
+    });
+}
+
+function tgApi(method, params = {}) {
+    return new Promise((resolve, reject) => {
+        const body = JSON.stringify(params);
+        const req = https.request(
+            {
+                hostname: 'api.telegram.org',
+                port: 443,
+                path: `/bot${BOT_TOKEN}/${method}`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(body),
+                },
+                timeout: 35000,
+            },
+            (res) => {
+                const chunks = [];
+                res.on('data', c => chunks.push(c));
+                res.on('end', () => {
+                    try {
+                        const parsed = JSON.parse(Buffer.concat(chunks).toString());
+                        if (parsed.ok) resolve(parsed.result);
+                        else reject(new Error(parsed.description || 'TG API error'));
+                    } catch (e) { reject(e); }
+                });
+                res.on('error', (e) => reject(new Error(e.message || String(e))));
+            }
+        );
+        req.on('error', (e) => reject(new Error(e.message || String(e))));
+        req.on('timeout', () => { req.destroy(); reject(new Error('request timeout')); });
+        req.write(body);
+        req.end();
+    });
+}
+
+// ─── Perceptual hash ──────────────────────────────────────────────────────────
+
+async function computePhash(buf) {
+    const pixels = await sharp(buf)
         .resize(8, 8, { fit: 'fill' })
         .greyscale()
         .raw()
         .toBuffer();
-
     const avg = pixels.reduce((s, v) => s + v, 0) / pixels.length;
     let hash = 0n;
     for (let i = 0; i < 64; i++) {
@@ -114,96 +161,72 @@ async function computePhash(imageBuffer) {
 }
 
 function hammingDistance(a, b) {
-    let x = a ^ b;
-    let dist = 0;
-    while (x) { dist += Number(x & 1n); x >>= 1n; }
-    return dist;
-}
-
-async function downloadPhoto(fileId) {
-    try {
-        const file = await bot.getFile(fileId);
-        const url  = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-        const resp = await axios.get(url, { responseType: 'arraybuffer', timeout: 8000 });
-        return Buffer.from(resp.data);
-    } catch (e) {
-        log('WARN', 'Failed to download photo', { fileId, err: e.message });
-        return null;
-    }
+    let x = a ^ b, d = 0;
+    while (x) { d += Number(x & 1n); x >>= 1n; }
+    return d;
 }
 
 async function getPhotoHash(userId) {
     try {
-        const photos = await bot.getUserProfilePhotos(userId, { limit: 1 });
+        const photos = await tgApi('getUserProfilePhotos', { user_id: userId, limit: 1 });
         if (!photos.total_count) return null;
-        const fileId = photos.photos[0].slice(-1)[0].file_id; // largest size
-        const buf    = await downloadPhoto(fileId);
-        if (!buf) return null;
+        const fileId = photos.photos[0].slice(-1)[0].file_id;
+        const file   = await tgApi('getFile', { file_id: fileId });
+        const url    = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+        const buf    = await httpsGet(url);
         return await computePhash(buf);
     } catch (e) {
-        log('WARN', 'getPhotoHash failed', { userId, err: e.message });
+        log('WARN', `getPhotoHash failed for ${userId}`, { err: e.message });
         return null;
     }
 }
 
-// ─── Mod photo hash cache (load at startup) ───────────────────────────────────
-
 async function loadModHashes() {
-    log('INFO', `Loading photo hashes for ${MODS.length} mods...`);
+    log('INFO', `Loading photo hashes for ${MODS.length} mod(s)...`);
     for (const mod of MODS) {
-        confirmedMods.add(mod.user_id);
         const hash = await getPhotoHash(mod.user_id);
         if (hash !== null) {
             modPhotoHashes.set(mod.user_id, hash);
-            log('INFO', `  ✓ ${mod.name} (${mod.username}) hash cached`);
+            log('INFO', `  ✓ ${mod.name} hash cached`);
         } else {
-            log('WARN', `  ✗ ${mod.name} — no photo or couldn't fetch`);
+            log('WARN', `  ✗ ${mod.name} — no photo`);
         }
-        await delay(500); // rate limit
+        await delay(600);
     }
-    log('INFO', `Mod hashes loaded: ${modPhotoHashes.size}/${MODS.length}`);
+    log('INFO', `Hashes loaded: ${modPhotoHashes.size}/${MODS.length}`);
 }
 
-// ─── Name similarity check ────────────────────────────────────────────────────
+// ─── Detection ────────────────────────────────────────────────────────────────
 
 function nameSimilarityScore(name) {
     if (!name) return { suspicious: false };
     const norm = name.toLowerCase().trim();
 
     for (const mod of MODS) {
-        // Build all name variants to check against
-        const nameVariants = [mod.name, ...(mod.aliases || [])];
-
-        for (const variant of nameVariants) {
+        const variants = [mod.name, ...(mod.aliases || [])];
+        for (const variant of variants) {
             const modName = variant.toLowerCase().trim();
-            const dist = Levenshtein.get(norm, modName);
-
-            // Also check if name CONTAINS the mod name (e.g. "Phill | Admin")
+            const dist    = Levenshtein.get(norm, modName);
             const contains = norm.includes(modName) || modName.includes(norm);
-
-            if (dist <= NAME_DIST_THRESHOLD || (contains && norm !== modName)) {
+            if (dist <= NAME_THRESH || (contains && norm !== modName)) {
                 return {
                     suspicious: true,
                     matchedMod: mod.name,
-                    distance: dist,
-                    reason: dist <= NAME_DIST_THRESHOLD
+                    reason: dist <= NAME_THRESH
                         ? `Name "${name}" is ${dist} edit(s) from mod "${variant}"`
-                        : `Name "${name}" contains/matches mod name "${variant}"`,
+                        : `Name "${name}" contains mod name "${variant}"`,
                 };
             }
         }
-
-        // Check username similarly
         if (mod.username) {
-            const modUser = mod.username.toLowerCase().replace('@', '');
+            const modUser  = mod.username.toLowerCase().replace('@', '');
             const userNorm = norm.replace('@', '');
-            const udist = Levenshtein.get(userNorm, modUser);
-            if (udist > 0 && udist <= NAME_DIST_THRESHOLD) {
+            const udist    = Levenshtein.get(userNorm, modUser);
+            if (udist > 0 && udist <= NAME_THRESH) {
                 return {
                     suspicious: true,
                     matchedMod: mod.name,
-                    distance: udist,
-                    reason: `Username "${name}" is ${udist} edit(s) from mod @${mod.username}`,
+                    reason: `Username "${name}" is ${udist} edit(s) from @${mod.username}`,
                 };
             }
         }
@@ -211,296 +234,278 @@ function nameSimilarityScore(name) {
     return { suspicious: false };
 }
 
-// ─── Photo similarity check ───────────────────────────────────────────────────
-
 async function photoSimilarityScore(userId) {
     if (!modPhotoHashes.size) return { suspicious: false };
     const userHash = await getPhotoHash(userId);
-    if (userHash === null) return { suspicious: false }; // no photo = skip
+    if (userHash === null) return { suspicious: false };
 
     for (const [modId, modHash] of modPhotoHashes) {
         const dist = hammingDistance(userHash, modHash);
-        if (dist <= PHOTO_HASH_THRESHOLD) {
+        if (dist <= PHOTO_THRESH) {
             const mod = MODS.find(m => m.user_id === modId);
             return {
                 suspicious: true,
                 matchedMod: mod ? mod.name : String(modId),
-                distance: dist,
-                reason: `Profile photo is similar to mod "${mod ? mod.name : modId}" (hamming=${dist})`,
+                reason: `Profile photo similar to ${mod ? mod.name : modId} (hamming=${dist})`,
             };
         }
     }
     return { suspicious: false };
 }
 
-// ─── DM bait detection ────────────────────────────────────────────────────────
-
-function isDmBait(text) {
-    if (!text) return false;
-    return DM_BAIT_PATTERNS.some(p => p.test(text));
-}
-
-// ─── Claim-to-be-mod detection ───────────────────────────────────────────────
-
-function claimsToBeAdmin(text) {
-    if (!text) return false;
-    const patterns = [
-        /\bi('?m| am)\s+(a\s+)?(mod|moderator|admin|official|team)/i,
-        /\bofficial\s+(team|support|moderator|admin)\b/i,
-        /\bnervos\s+(official|support|admin|mod)\b/i,
-        /\bckb\s+(official|support|admin|mod)\b/i,
-    ];
-    return patterns.some(p => p.test(text));
-}
-
-// ─── Ban action ───────────────────────────────────────────────────────────────
-
-async function banUser(userId, username, reason, triggeredBy = 'auto') {
-    try {
-        await bot.banChatMember(CHAT_ID, userId);
-        log('BAN', `Banned user ${userId} (${username})`, { reason });
-
-        appendBanLog({ userId, username, reason, triggeredBy });
-
-        const alert = [
-            `🚫 *Scammer banned*`,
-            ``,
-            `👤 User: ${username ? '@' + username : 'no username'} (ID: \`${userId}\`)`,
-            `📋 Reason: ${reason}`,
-            `🤖 Triggered by: ${triggeredBy}`,
-        ].join('\n');
-
-        await bot.sendMessage(ALERT_CHAT, alert, { parse_mode: 'Markdown' });
-        return true;
-    } catch (e) {
-        log('ERROR', 'Ban failed', { userId, err: e.message });
-        return false;
-    }
-}
-
-async function deleteMessage(chatId, messageId) {
-    try {
-        await bot.deleteMessage(chatId, messageId);
-    } catch (e) {
-        log('WARN', 'Delete message failed', { messageId, err: e.message });
-    }
-}
-
-// ─── Full user check (for new members) ───────────────────────────────────────
+function isDmBait(text)      { return DM_BAIT_PATTERNS.some(p => p.test(text)); }
+function claimsAdmin(text)   { return ADMIN_CLAIM_PATTERNS.some(p => p.test(text)); }
 
 async function checkUser(userId, firstName, lastName, username) {
-    if (confirmedMods.has(userId)) return; // skip real mods
-
+    if (confirmedMods.has(userId)) return { suspicious: false };
     const fullName = [firstName, lastName].filter(Boolean).join(' ');
     const checks   = [];
-
-    // 1. Name check (fast)
     const nameCheck = nameSimilarityScore(fullName);
     if (nameCheck.suspicious) checks.push(nameCheck);
-
-    // Also check display name vs username
     if (username) {
         const unCheck = nameSimilarityScore(username);
         if (unCheck.suspicious) checks.push(unCheck);
     }
-
-    // 2. Photo check (slower — only if name looks suspicious or as extra check)
     const photoCheck = await photoSimilarityScore(userId);
     if (photoCheck.suspicious) checks.push(photoCheck);
-
     if (checks.length > 0) {
-        const reasons = checks.map(c => c.reason).join('; ');
-        log('ALERT', `Suspicious user detected`, { userId, fullName, username, reasons });
-        return { suspicious: true, reasons };
+        return { suspicious: true, reasons: checks.map(c => c.reason).join('; ') };
     }
     return { suspicious: false };
 }
 
-// ─── Event handlers ───────────────────────────────────────────────────────────
+// ─── Actions ──────────────────────────────────────────────────────────────────
 
-// New member joined
-bot.on('new_chat_members', async (msg) => {
-    if (String(msg.chat.id) !== String(CHAT_ID)) return;
+async function banUser(userId, username, reason, trigger) {
+    try {
+        await tgApi('banChatMember', { chat_id: CHAT_ID, user_id: userId });
+        log('BAN', `Banned ${userId} (@${username})`, { reason });
+        appendBanLog({ userId, username, reason, trigger });
+        const alert =
+            `🚫 *Scammer banned*\n\n` +
+            `👤 ${username ? '@' + username : 'no username'} (ID: \`${userId}\`)\n` +
+            `📋 ${reason}\n` +
+            `🤖 Trigger: ${trigger}`;
+        await tgApi('sendMessage', { chat_id: ALERT_CHAT, text: alert, parse_mode: 'Markdown' });
+    } catch (e) {
+        log('ERROR', 'Ban failed', { userId, err: e.message });
+    }
+}
 
-    for (const member of msg.new_chat_members) {
+async function deleteMsg(chatId, messageId) {
+    try { await tgApi('deleteMessage', { chat_id: chatId, message_id: messageId }); }
+    catch (e) { log('WARN', 'Delete failed', { messageId, err: e.message }); }
+}
+
+async function sendMsg(chatId, text, extra = {}) {
+    try { await tgApi('sendMessage', { chat_id: chatId, text, ...extra }); }
+    catch (e) { log('WARN', 'Send failed', { err: e.message }); }
+}
+
+// ─── Update handlers ──────────────────────────────────────────────────────────
+
+async function handleNewMembers(msg) {
+    for (const member of (msg.new_chat_members || [])) {
         if (member.is_bot) continue;
-        const userId   = member.id;
-        const username = member.username;
-        const first    = member.first_name || '';
-        const last     = member.last_name  || '';
-
-        log('INFO', `New member: ${first} ${last} (@${username}) [${userId}]`);
-
+        const { id: userId, username, first_name: first, last_name: last } = member;
+        log('INFO', `New member: ${first} ${last || ''} (@${username}) [${userId}]`);
         const result = await checkUser(userId, first, last, username);
-        if (result && result.suspicious) {
-            // Delete join message
-            await deleteMessage(CHAT_ID, msg.message_id);
-            // Ban immediately
+        if (result.suspicious) {
+            await deleteMsg(CHAT_ID, msg.message_id);
             await banUser(userId, username,
                 `Fake mod on join: ${result.reasons}`, 'join-check');
         }
     }
-});
+}
 
-// Messages
-bot.on('message', async (msg) => {
-    if (!msg.chat || String(msg.chat.id) !== String(CHAT_ID)) return;
-    if (!msg.from || msg.from.is_bot) return;
+async function handleMessage(msg) {
+    const from = msg.from;
+    if (!from || from.is_bot) return;
+    const { id: userId, username, first_name: first, last_name: last } = from;
+    const text  = msg.text || msg.caption || '';
+    const msgId = msg.message_id;
 
-    const userId   = msg.from.id;
-    const username = msg.from.username;
-    const first    = msg.from.first_name || '';
-    const last     = msg.from.last_name  || '';
-    const text     = msg.text || msg.caption || '';
-    const msgId    = msg.message_id;
+    if (confirmedMods.has(userId)) return;
+    if (!text) return;
 
-    if (confirmedMods.has(userId)) return; // skip real mods
+    const baiting  = isDmBait(text);
+    const claiming = claimsAdmin(text);
 
-    // Check for DM bait or admin claim
-    const baiting = isDmBait(text);
-    const claiming = claimsToBeAdmin(text);
+    if (!baiting && !claiming) return;
 
-    if (baiting || claiming) {
-        log('ALERT', `DM bait/claim from ${userId}`, { text: text.slice(0, 100) });
+    log('ALERT', `Suspicious message from ${userId}`, { text: text.slice(0, 120) });
 
-        // Also run user check to see if they look like a fake mod
-        const userCheck = await checkUser(userId, first, last, username);
+    const userCheck = await checkUser(userId, first, last, username);
 
-        if (userCheck.suspicious || claiming) {
-            // High confidence — delete + ban immediately
-            await deleteMessage(CHAT_ID, msgId);
+    if (claiming || userCheck.suspicious) {
+        // High confidence — immediate ban
+        await deleteMsg(CHAT_ID, msgId);
+        const reasons = [
+            baiting  ? 'DM-baiting' : null,
+            claiming ? 'Claims to be admin' : null,
+            userCheck.suspicious ? userCheck.reasons : null,
+        ].filter(Boolean).join('; ');
+        await banUser(userId, username, reasons, 'message-check');
+
+    } else if (baiting && WARN_FIRST) {
+        const warnCount = (warnings.get(userId) || 0) + 1;
+        warnings.set(userId, warnCount);
+        await deleteMsg(CHAT_ID, msgId);
+        if (warnCount >= 2) {
             await banUser(userId, username,
-                [
-                    baiting  ? 'DM-baiting message' : null,
-                    claiming ? 'Claims to be admin/mod' : null,
-                    userCheck.suspicious ? `Fake mod appearance: ${userCheck.reasons}` : null,
-                ].filter(Boolean).join('; '),
-                'message-check');
-        } else if (baiting && WARN_FIRST) {
-            // DM bait only, warn first
-            const warnCount = (warnings.get(userId) || 0) + 1;
-            warnings.set(userId, warnCount);
-
-            if (warnCount >= 2) {
-                await deleteMessage(CHAT_ID, msgId);
-                await banUser(userId, username,
-                    `Repeated DM-baiting after warning (${warnCount}x)`, 'warn-threshold');
-            } else {
-                await deleteMessage(CHAT_ID, msgId);
-                try {
-                    await bot.sendMessage(CHAT_ID,
-                        `⚠️ @${username || first} — asking people to DM you is not allowed here. ` +
-                        `This is warning 1/${2}. Next violation = ban.`,
-                        { reply_to_message_id: msgId }
-                    );
-                } catch {}
-            }
+                `Repeated DM-baiting after ${warnCount - 1} warning(s)`, 'warn-threshold');
         } else {
-            // No warn-first mode, just ban
-            await deleteMessage(CHAT_ID, msgId);
-            await banUser(userId, username, 'DM-baiting message', 'message-check');
+            await sendMsg(CHAT_ID,
+                `⚠️ ${username ? '@' + username : first} — asking people to DM you is not allowed here. ` +
+                `Warning 1/2. Next offence = ban.`);
+        }
+    } else {
+        await deleteMsg(CHAT_ID, msgId);
+        await banUser(userId, username, 'DM-baiting message', 'message-check');
+    }
+}
+
+async function handleCommand(msg) {
+    if (!confirmedMods.has(msg.from.id)) return;
+    const text = msg.text || '';
+    const chatId = String(msg.chat.id);
+
+    if (text.startsWith('/bans')) {
+        const n = parseInt(text.split(' ')[1] || '5');
+        let banLog = [];
+        if (fs.existsSync(BANLOG_PATH)) {
+            try { banLog = JSON.parse(fs.readFileSync(BANLOG_PATH, 'utf8')); } catch {}
+        }
+        const recent = banLog.slice(-n).reverse();
+        if (!recent.length) return sendMsg(chatId, '📋 No bans logged yet.');
+        const lines = recent.map((b, i) =>
+            `${i+1}. @${b.username || 'n/a'} (${b.userId})\n   ${b.reason}\n   ${b.ts}`
+        ).join('\n\n');
+        return sendMsg(chatId, `📋 *Last ${recent.length} bans:*\n\n${lines}`, { parse_mode: 'Markdown' });
+    }
+
+    if (text.startsWith('/refreshhashes')) {
+        await sendMsg(chatId, '🔄 Refreshing mod photo hashes...');
+        modPhotoHashes.clear();
+        await loadModHashes();
+        return sendMsg(chatId, `✅ Hashes refreshed for ${modPhotoHashes.size} mod(s).`);
+    }
+
+    if (text.startsWith('/checkme')) {
+        const { from: f } = msg;
+        const result = await checkUser(f.id, f.first_name, f.last_name, f.username);
+        return sendMsg(chatId,
+            result.suspicious
+                ? `⚠️ Would flag: ${result.reasons}`
+                : `✅ Looks clean (name OK, photo OK)`,
+            { reply_to_message_id: msg.message_id });
+    }
+
+    if (text.startsWith('/status')) {
+        return sendMsg(chatId,
+            `🛡️ PoPo Bot active\n` +
+            `Mods protected: ${MODS.length}\n` +
+            `Photo hashes cached: ${modPhotoHashes.size}\n` +
+            `Active warnings: ${warnings.size}\n` +
+            `Last update ID: ${lastUpdateId}`);
+    }
+}
+
+// ─── Polling loop ─────────────────────────────────────────────────────────────
+
+async function poll() {
+    try {
+        const updates = await tgApi('getUpdates', {
+            offset: lastUpdateId + 1,
+            timeout: 30,
+            allowed_updates: ['message', 'chat_member'],
+        });
+
+        for (const update of (updates || [])) {
+            lastUpdateId = update.update_id;
+            const msg = update.message;
+            if (!msg) continue;
+
+            const chatId = String(msg.chat.id);
+            if (chatId !== CHAT_ID && chatId !== ALERT_CHAT) {
+                // Private message to bot — only handle commands from mods
+                if (msg.text && msg.text.startsWith('/')) {
+                    await handleCommand(msg);
+                }
+                continue;
+            }
+
+            if (msg.new_chat_members) {
+                await handleNewMembers(msg);
+            } else if (msg.text || msg.caption) {
+                if (msg.text && msg.text.startsWith('/')) {
+                    await handleCommand(msg);
+                } else {
+                    await handleMessage(msg);
+                }
+            }
+        }
+    } catch (e) {
+        const errMsg = e.message || String(e);
+        // AggregateError usually means a conflict (another instance polling)
+        if (errMsg.includes('AggregateError') || errMsg.includes('Conflict')) {
+            log('WARN', 'Poll conflict — another instance may be running, waiting 10s');
+            await delay(10000);
+        } else {
+            log('WARN', 'Poll error', { err: errMsg });
+            await delay(5000);
         }
     }
-});
+}
 
-// Handle left/banned chat member (clean up warnings)
-bot.on('left_chat_member', (msg) => {
-    if (msg.left_chat_member) {
-        warnings.delete(msg.left_chat_member.id);
-    }
-});
-
-// ─── /checkme command (for testing — admin only) ──────────────────────────────
-
-bot.onText(/\/checkme/, async (msg) => {
-    if (String(msg.chat.id) !== String(CHAT_ID)) return;
-    if (!confirmedMods.has(msg.from.id)) return; // mods only
-
-    const { from } = msg;
-    const result = await checkUser(from.id, from.first_name, from.last_name, from.username);
-    await bot.sendMessage(CHAT_ID,
-        result.suspicious
-            ? `⚠️ Would flag: ${result.reasons}`
-            : `✅ Looks clean (name distance OK, photo OK)`,
-        { reply_to_message_id: msg.message_id }
-    );
-});
-
-// ─── /refreshhashes command (update mod photo hashes) ────────────────────────
-
-bot.onText(/\/refreshhashes/, async (msg) => {
-    if (String(msg.chat.id) !== String(CHAT_ID)) return;
-    if (!confirmedMods.has(msg.from.id)) return;
-
-    await bot.sendMessage(CHAT_ID, '🔄 Refreshing mod photo hashes...', {});
-    modPhotoHashes.clear();
-    await loadModHashes();
-    await bot.sendMessage(CHAT_ID,
-        `✅ Hashes refreshed for ${modPhotoHashes.size} mods.`);
-});
-
-// ─── /bans command (show recent bans) ────────────────────────────────────────
-
-bot.onText(/\/bans(?:\s+(\d+))?/, async (msg, match) => {
-    if (!confirmedMods.has(msg.from.id)) return;
-    const n = parseInt(match[1] || '5');
-    let banLog = [];
-    if (fs.existsSync(BANLOG_PATH)) {
-        try { banLog = JSON.parse(fs.readFileSync(BANLOG_PATH, 'utf8')); } catch {}
-    }
-    const recent = banLog.slice(-n).reverse();
-    if (!recent.length) {
-        return bot.sendMessage(CHAT_ID, '📋 No bans logged yet.');
-    }
-    const lines = recent.map((b, i) =>
-        `${i+1}. @${b.username || 'n/a'} (${b.userId})\n   ${b.reason}\n   ${b.ts}`
-    ).join('\n\n');
-    await bot.sendMessage(CHAT_ID,
-        `📋 *Last ${recent.length} bans:*\n\n${lines}`,
-        { parse_mode: 'Markdown' });
-});
-
-// ─── Startup ──────────────────────────────────────────────────────────────────
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function main() {
-    log('INFO', '🛡️  CKB Anti-Scam Bot starting...');
+    log('INFO', '🛡️  PoPo Bot (CKB Anti-Scam) starting...');
     log('INFO', `Group: ${CHAT_ID}`);
-    log('INFO', `Mods: ${MODS.map(m => m.name).join(', ')}`);
-    log('INFO', `Name threshold: ≤${NAME_DIST_THRESHOLD} edits`);
-    log('INFO', `Photo threshold: ≤${PHOTO_HASH_THRESHOLD} hamming`);
-    log('INFO', `Warn first: ${WARN_FIRST}`);
+    log('INFO', `Mods: ${MODS.map(m => `${m.name} (@${m.username})`).join(', ')}`);
 
-    // Verify bot is admin
-    try {
-        const me = await bot.getMe();
-        log('INFO', `Bot: @${me.username} (${me.id})`);
+    // Brief startup delay to avoid conflicts with previous instance
+    await delay(3000);
 
-        const chatMember = await bot.getChatMember(CHAT_ID, me.id);
-        if (!['administrator', 'creator'].includes(chatMember.status)) {
-            log('ERROR', '❌ Bot is NOT an admin in this group. Ban/delete will fail.');
-        } else {
-            log('INFO', '✅ Bot is admin');
+    // Verify bot identity (retry up to 5x for startup network settling)
+    let me = null;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+            me = await tgApi('getMe');
+            log('INFO', `Bot: @${me.username} (${me.id})`);
+            break;
+        } catch (e) {
+            log('WARN', `getMe attempt ${attempt}/5 failed`, { err: e.message });
+            if (attempt === 5) {
+                log('ERROR', 'getMe failed after 5 attempts — exiting');
+                process.exit(1);
+            }
+            await delay(5000);
         }
-    } catch (e) {
-        log('ERROR', 'Startup check failed', { err: e.message });
     }
 
     // Load mod photo hashes
     await loadModHashes();
 
-    log('INFO', '✅ Bot running — watching for scammers');
-
-    // Reload hashes every 6 hours (mods can change their photos)
+    // Refresh hashes every 6 hours
     setInterval(async () => {
-        log('INFO', 'Scheduled hash refresh...');
+        log('INFO', 'Scheduled photo hash refresh...');
         modPhotoHashes.clear();
         await loadModHashes();
     }, 6 * 60 * 60 * 1000);
+
+    log('INFO', '✅ Polling for updates...');
+
+    // Long-polling loop
+    while (true) {
+        await poll();
+    }
 }
 
 main().catch(e => {
-    log('ERROR', 'Fatal error', { err: e.message });
+    log('ERROR', 'Fatal', { err: e.message });
     process.exit(1);
 });
