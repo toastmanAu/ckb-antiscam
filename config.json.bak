@@ -1,0 +1,36 @@
+{
+  "bot_token": "6293397965:AAHv3MNDEag_D81pyAS5Z0b_VWX4Bw9CFvE",
+
+  "groups": [
+    {
+      "id": "-1001044500844",
+      "name": "Nervos Nation",
+      "alert_chat": "-1001044500844",
+      "dry_run": true
+    },
+    {
+      "id": "-1001338982855",
+      "name": "Nervos Community",
+      "alert_chat": "-1001044500844",
+      "dry_run": true
+    }
+  ],
+
+  "mods": [
+    {
+      "name": "Phill",
+      "username": "toastmanAu",
+      "user_id": 1790655432,
+      "aliases": [
+        "Phillip",
+        "Phill | Phillip.bit",
+        "Phillip.bit"
+      ]
+    }
+  ],
+
+  "name_dist_threshold": 2,
+  "photo_hash_threshold": 10,
+  "warn_first": true,
+  "dry_run": true
+}

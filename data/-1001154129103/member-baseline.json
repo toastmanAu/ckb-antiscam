@@ -1,0 +1,92 @@
+{
+  "168932943": {
+    "id": 168932943,
+    "username": "busyforking",
+    "name": "busyforking",
+    "role": "administrator",
+    "is_bot": false,
+    "seeded_at": "2026-03-06T05:06:20.706Z",
+    "source": "admin_list"
+  },
+  "343419622": {
+    "id": 343419622,
+    "username": "knwang",
+    "name": "Kevin Wang",
+    "role": "administrator",
+    "is_bot": false,
+    "seeded_at": "2026-03-06T05:06:20.706Z",
+    "source": "admin_list"
+  },
+  "397893625": {
+    "id": 397893625,
+    "username": "mattQuinn",
+    "name": "Matt",
+    "role": "creator",
+    "is_bot": false,
+    "seeded_at": "2026-03-06T05:06:20.705Z",
+    "source": "admin_list"
+  },
+  "799826150": {
+    "id": 799826150,
+    "username": "Chema_es",
+    "name": "Chema",
+    "role": "administrator",
+    "is_bot": false,
+    "seeded_at": "2026-03-06T05:06:20.706Z",
+    "source": "admin_list"
+  },
+  "1410079949": {
+    "id": 1410079949,
+    "username": "KevinTckb",
+    "name": "KevinTCKB.NervosNation.bit",
+    "role": "administrator",
+    "is_bot": false,
+    "seeded_at": "2026-03-06T05:06:20.706Z",
+    "source": "admin_list"
+  },
+  "1579946980": {
+    "id": 1579946980,
+    "username": "RennyHodler",
+    "name": "Ren",
+    "role": "administrator",
+    "is_bot": false,
+    "seeded_at": "2026-03-06T05:06:20.706Z",
+    "source": "admin_list"
+  },
+  "1590977427": {
+    "id": 1590977427,
+    "username": "imbl8tently",
+    "name": "I am (if I DM I scam)",
+    "role": "administrator",
+    "is_bot": false,
+    "seeded_at": "2026-03-06T05:06:20.706Z",
+    "source": "admin_list"
+  },
+  "1790655432": {
+    "id": 1790655432,
+    "username": "Wyltek",
+    "name": "Phill | Phillip.bit (never DM, always in public)",
+    "role": "administrator",
+    "is_bot": false,
+    "seeded_at": "2026-03-06T05:06:20.706Z",
+    "source": "admin_list"
+  },
+  "2103950988": {
+    "id": 2103950988,
+    "username": "zz_tovarishch",
+    "name": "舟舟 tovarishch",
+    "role": "administrator",
+    "is_bot": false,
+    "seeded_at": "2026-03-06T05:06:20.706Z",
+    "source": "admin_list"
+  },
+  "7138613671": {
+    "id": 7138613671,
+    "username": "Nervos_bot",
+    "name": "CKBot",
+    "role": "administrator",
+    "is_bot": true,
+    "seeded_at": "2026-03-06T05:06:20.706Z",
+    "source": "admin_list"
+  }
+}
