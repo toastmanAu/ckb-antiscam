@@ -1495,7 +1495,7 @@ async function main() {
 
     // Load mod photo hashes + member baselines
     await loadModHashes();
-    for (const grp of Object.values(groups)) loadMemberBaseline(grp);
+    for (const grp of GROUPS) loadMemberBaseline(grp);
 
     // Refresh hashes every 6 hours + age out stale predictions
     setInterval(async () => {
@@ -1503,10 +1503,10 @@ async function main() {
         modPhotoHashes.clear();
         await loadModHashes();
         if (LEARN_MODE) {
-            for (const grp of Object.values(groups)) agePredictions(grp);
+            for (const grp of GROUPS) agePredictions(grp);
         }
         // Graduate clean users to member baseline (in group 24h+ with score < 5)
-        for (const grp of Object.values(groups)) {
+        for (const grp of GROUPS) {
             const now = Date.now();
             for (const [uid, beh] of behaviourMap.entries()) {
                 if (beh.joinTs && (now - beh.joinTs) > 24 * 3600 * 1000 && beh.score < 5) {
