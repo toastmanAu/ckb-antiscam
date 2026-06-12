@@ -19,7 +19,7 @@ const https = require('https');
 const config   = JSON.parse(fs.readFileSync('./config.json', 'utf8'));
 const GROUP_ID = config.groups[0].id;
 const TOKEN    = config.bot_token;
-const DATA_DIR = path.join(__dirname, 'data', GROUP_ID);
+const DATA_DIR = path.join(__dirname, 'data', String(GROUP_ID).replace(/^-/, ''));
 const OUT_FILE = path.join(DATA_DIR, 'member-baseline.json');
 
 fs.mkdirSync(DATA_DIR, { recursive: true });

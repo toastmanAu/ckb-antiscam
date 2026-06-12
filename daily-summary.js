@@ -57,7 +57,7 @@ const summaries = [];
 
 for (const g of (config.groups || [])) {
     const name     = g.name || g.id;
-    const dataDir  = path.join(__dirname, 'data', String(g.id));
+    const dataDir  = path.join(__dirname, 'data', String(g.id).replace(/^-/, ''));
     const alertChat = g.alert_chat || g.id;
 
     const events      = loadJsonl(path.join(dataDir, 'event-log.jsonl')).filter(e => e.ts >= cutoff);

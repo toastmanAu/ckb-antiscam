@@ -284,31 +284,20 @@ async function handleReaction(update) {
                        (nameFlag ? `, suspicious name "${name}"` : '');
         log('ALERT', `[${grp.name}] Honeypot detected: ${user.id} (@${user.username}) — ${reason}`);
         reactionTracker.delete(user.id);
-
-        if (grp.dryRun) {
-            log('DRY-RUN', `[${grp.name}] Would ban honeypot ${user.id}`, { reason });
-            appendBanLog(grp, { userId: user.id, username: user.username, reason, trigger: 'honeypot-reaction', dry_run: true });
-            return;
-        }
-        try {
-            await tgApi('banChatMember', { chat_id: grp.id, user_id: user.id });
-            const alert =
-                `🍯 *Honeypot account banned* (${grp.name})\n\n` +
-                `👤 ${user.username ? '@' + user.username : name} (ID: \`${user.id}\`)\n` +
-                `📋 ${reason}\n` +
-                `🤖 Trigger: honeypot-reaction`;
-            await tgApi('sendMessage', { chat_id: grp.alertChat, text: alert, parse_mode: 'Markdown' });
-            appendBanLog(grp, { userId: user.id, username: user.username, reason, trigger: 'honeypot-reaction' });
-            log('BAN', `[${grp.name}] Banned honeypot ${user.id}`, { reason });
-        } catch (e) {
-            log('ERROR', 'Honeypot ban failed', { userId: user.id, err: e.message });
-        }
+        logEvent(grp, 'detection', {
+            userId: user.id, username: user.username || null,
+            detector: 'honeypot-reaction',
+            reactionCount: tracker.reactionCount, nameFlag,
+        });
+        // banUser handles dry-run, prediction logging, ban-log, and the alert
+        await banUser(grp, user.id, user.username, reason, 'honeypot-reaction', tracker.reactionCount, [reason]);
     }
 }
 const modPhotoHashes = new Map();  // userId → BigInt hash
 const warnings       = new Map();  // userId → warn count
 const confirmedMods  = new Set(MODS.map(m => m.user_id));
 let   lastUpdateId   = 0;
+let   BOT_ID         = null;       // set from getMe() at startup
 
 // ─── Member baseline (established members — exempt from join scoring) ─────────
 // Loaded from data/<groupId>/member-baseline.json on startup + periodically refreshed.
@@ -396,7 +385,7 @@ function logEvent(grp, type, data) {
  * Log a bot prediction (would_ban / would_delete / would_restrict).
  * Called every time the bot decides to take action, whether dry_run or not.
  */
-function logPrediction(grp, userId, username, trigger, score, action, reasons) {
+function logPrediction(grp, userId, username, trigger, score, action, reasons, enforced = false) {
     if (!LEARN_MODE) return;
     const entry = {
         ts:        Date.now(),
@@ -407,6 +396,7 @@ function logPrediction(grp, userId, username, trigger, score, action, reasons) {
         score,
         action,       // 'ban' | 'restrict' | 'delete' | 'warn'
         reasons,
+        enforced,     // true = bot actually executed the action (not dry-run)
         outcome:   null,  // filled in later when/if admin confirms
         matched:   false,
     };
@@ -453,8 +443,8 @@ function logAdminAction(grp, actorId, actorUsername, targetUserId, targetUsernam
 function reconcilePrediction(grp, userId, adminAction, iso) {
     const p = predictionsPath(grp);
     if (!fs.existsSync(p)) {
-        // No predictions yet — log as false negative
-        logFalseNegative(grp, userId, adminAction, iso);
+        // No predictions yet — log as false negative (unless admin is undoing something)
+        if (adminAction !== 'unban') logFalseNegative(grp, userId, adminAction, iso);
         return;
     }
 
@@ -464,7 +454,18 @@ function reconcilePrediction(grp, userId, adminAction, iso) {
     const updated = lines.map(line => {
         try {
             const pred = JSON.parse(line);
-            if (pred.userId === userId && pred.outcome === null) {
+            if (pred.userId !== userId) return JSON.stringify(pred);
+
+            if (adminAction === 'unban') {
+                // Admin reversed a ban — if WE banned this user, that's a false positive
+                if (pred.enforced && (pred.outcome === null || pred.outcome === 'TRUE_POSITIVE')) {
+                    matched = true;
+                    pred.outcome = 'FALSE_POSITIVE';
+                    pred.matched = true;
+                    pred.reversedBy = 'unban';
+                    pred.reversedAt = iso;
+                }
+            } else if (pred.outcome === null) {
                 matched = true;
                 pred.outcome = 'TRUE_POSITIVE';
                 pred.matched = true;
@@ -477,7 +478,7 @@ function reconcilePrediction(grp, userId, adminAction, iso) {
 
     fs.writeFileSync(p, updated.join('\n') + '\n');
 
-    if (!matched) {
+    if (!matched && adminAction !== 'unban') {
         logFalseNegative(grp, userId, adminAction, iso);
     }
 }
@@ -500,8 +501,9 @@ function logFalseNegative(grp, userId, adminAction, iso) {
 }
 
 /**
- * Periodically mark unmatched predictions older than 48h as FALSE_POSITIVE
- * (bot flagged, but no admin action followed → likely wrong).
+ * Periodically resolve unmatched predictions older than 48h.
+ * Dry-run prediction with no admin follow-up → FALSE_POSITIVE (bot flagged, admins disagreed).
+ * Enforced ban with no admin reversal      → TRUE_POSITIVE (admins let it stand).
  */
 function agePredictions(grp) {
     if (!LEARN_MODE) return;
@@ -516,7 +518,7 @@ function agePredictions(grp) {
         try {
             const pred = JSON.parse(line);
             if (pred.outcome === null && pred.ts < cutoff) {
-                pred.outcome  = 'FALSE_POSITIVE';
+                pred.outcome  = pred.enforced ? 'TRUE_POSITIVE' : 'FALSE_POSITIVE';
                 pred.agedOut  = true;
                 changed = true;
             }
@@ -711,7 +713,7 @@ async function checkUser(userId, firstName, lastName, username) {
 
 async function banUser(grp, userId, username, reason, trigger, score = 0, reasons = []) {
     // Always log prediction in learn mode (regardless of dry_run)
-    logPrediction(grp, userId, username, trigger, score, 'ban', reasons);
+    logPrediction(grp, userId, username, trigger, score, 'ban', reasons, !grp.dryRun);
 
     if (grp.dryRun) {
         log('DRY-RUN', `[${grp.name}] Would ban ${userId} (@${username})`, { reason, trigger });
@@ -736,7 +738,7 @@ async function banUser(grp, userId, username, reason, trigger, score = 0, reason
 }
 
 async function deleteMsg(grp, messageId, userId, trigger, score) {
-    logPrediction(grp, userId, null, trigger || 'delete', score || 0, 'delete', []);
+    logPrediction(grp, userId, null, trigger || 'delete', score || 0, 'delete', [], !grp.dryRun);
     if (grp.dryRun) { log('DRY-RUN', `[${grp.name}] Would delete message ${messageId}`); return; }
     try { await tgApi('deleteMessage', { chat_id: grp.id, message_id: messageId }); }
     catch (e) { log('WARN', 'Delete failed', { messageId, err: e.message }); }
@@ -762,6 +764,61 @@ const BOT_BAN_SCORE   = config.bot_behaviour?.ban_score   ?? 6;
 const BOT_ALERT_SCORE = config.bot_behaviour?.alert_score ?? 4;
 const BOT_FLAG_SCORE  = config.bot_behaviour?.flag_score  ?? 2;
 
+// Telegram blast-ad bot display names ("paper plane" mass-DM promo spam,
+// e.g. "RO🌈纸飞机 推广 全网超低价 日發500萬次") — seen joining in bursts during
+// the 2026-03-16 wave. These keywords are advertising jargon, not conversation.
+const SPAM_AD_NAME_PATTERN = /(纸飞机|纸飛机|紙飛機|群发|群發|日发|日發|代发|代發|推广|推廣|引流|超低价|超低價|会员激活|會員激活|广告|廣告|加粉|拉人|协议号|協議號)/;
+
+// Random-string usernames (e.g. "kbfkIHxOLYeJHvFSfkBbKX", "TxLossdGQzMWZQ")
+// — throwaway accounts auto-generated by bot farms. Heuristic: long letter
+// runs with almost no vowels, or erratic case flipping mid-word.
+function looksRandomUsername(username) {
+    if (!username) return false;
+    const letters = username.replace(/[^a-zA-Z]/g, '');
+    if (letters.length < 8) return false;
+    const vowels = (letters.match(/[aeiou]/gi) || []).length;
+    let caseFlips = 0;
+    for (let i = 1; i < letters.length; i++) {
+        const wasLower = /[a-z]/.test(letters[i - 1]);
+        const isLower  = /[a-z]/.test(letters[i]);
+        if (wasLower !== isLower) caseFlips++;
+    }
+    return (vowels / letters.length) < 0.15 || caseFlips >= 5;
+}
+
+// One-time metadata scoring for a user — runs at join if we see it,
+// otherwise on their first message (for members who pre-date the bot).
+function scoreUserMetadata(beh, userId, user) {
+    if (beh.metaScored) return;
+    beh.metaScored = true;
+
+    if (!user.username) {
+        addScore(beh, 1, 'No username set');
+    } else if (looksRandomUsername(user.username)) {
+        addScore(beh, 2, `Random-string username: @${user.username}`);
+    }
+
+    // Very new account (Telegram user IDs are roughly sequential/chronological)
+    // IDs above ~7.5B were registered after ~2024, common for bot farms
+    if (userId > 7_500_000_000) {
+        addScore(beh, 1, `Very new account (user_id=${userId})`);
+    }
+
+    const name = [user.first_name, user.last_name].filter(Boolean).join(' ');
+    if (SPAM_AD_NAME_PATTERN.test(name)) {
+        addScore(beh, 4, `Ad-blast spam name: "${name}"`);
+    }
+
+    // Language code mismatch — account says non-English but name is English
+    const lang = user.language_code || '';
+    const lowerName = (user.first_name || '').toLowerCase();
+    const englishName = /^[a-z\s'-]+$/.test(lowerName);
+    if (englishName && lang && !lang.startsWith('en') &&
+        ['ru', 'zh', 'vi', 'id', 'tr', 'ar', 'fa'].some(l => lang.startsWith(l))) {
+        addScore(beh, 1, `Language mismatch: name="${lowerName}" lang=${lang}`);
+    }
+}
+
 // Per-user behavioural state
 // userId → {
 //   joinTs, lastMsgTs, msgCount, msgIntervals[],
@@ -784,6 +841,7 @@ function getBehaviour(userId) {
             scoreReasons: [],
             warned:       false,
             flagged:      false,
+            metaScored:   false,
         });
     }
     return behaviourMap.get(userId);
@@ -877,26 +935,8 @@ function scoreBehaviourOnMessage(userId, msg) {
         }
     }
 
-    // ── Signal 6: User metadata flags ──
-    if (beh.msgCount === 1) { // only check once per user
-        // No username (anonymous-ish account)
-        if (!from.username) {
-            addScore(beh, 1, 'No username set');
-        }
-        // Language code mismatch — account says non-English but name is English
-        const lang = from.language_code || '';
-        const name = (from.first_name || '').toLowerCase();
-        const englishName = /^[a-z\s'-]+$/.test(name);
-        if (englishName && lang && !lang.startsWith('en') &&
-            ['ru', 'zh', 'vi', 'id', 'tr', 'ar', 'fa'].some(l => lang.startsWith(l))) {
-            addScore(beh, 1, `Language mismatch: name="${name}" lang=${lang}`);
-        }
-        // Very new account (Telegram user IDs are roughly sequential/chronological)
-        // IDs above ~7.5B were registered after ~2024, common for bot farms
-        if (userId > 7_500_000_000) {
-            addScore(beh, 1, `Very new account (user_id=${userId})`);
-        }
-    }
+    // ── Signal 6: User metadata flags (once per user — at join or first message) ──
+    scoreUserMetadata(beh, userId, from);
 
     return beh;
 }
@@ -940,7 +980,7 @@ async function handleChatMember(update) {
     // and resulted in a ban/kick/restrict → log as admin action for calibration.
     if (LEARN_MODE && cm.from && !cm.from.is_bot) {
         const actor = cm.from;
-        const isOurBot = actor.id === 7138613671; // @Nervos_bot
+        const isOurBot = BOT_ID !== null && actor.id === BOT_ID;
         if (!isOurBot && actor.id !== (newUser?.id)) {
             // actor is a human doing something to newUser/user
             if (newStatus === 'kicked' || newStatus === 'banned') {
@@ -952,6 +992,16 @@ async function handleChatMember(update) {
                     `Admin action: ${actor.username || actor.id} banned ${user.username || user.id}`
                 );
                 log('LEARN', `[${grp.name}] Admin ban observed: ${actor.username || actor.id} → ${user.username || user.id} (${user.id})`);
+            } else if (oldStatus === 'kicked' && (newStatus === 'left' || newStatus === 'member')) {
+                // Admin lifted a ban — if it was one of ours, that's a false positive
+                logAdminAction(
+                    grp,
+                    actor.id, actor.username,
+                    user.id, user.username,
+                    'unban',
+                    `Admin action: ${actor.username || actor.id} unbanned ${user.username || user.id}`
+                );
+                log('LEARN', `[${grp.name}] Admin unban observed: ${actor.username || actor.id} → ${user.username || user.id} (${user.id})`);
             } else if (newStatus === 'restricted') {
                 logAdminAction(
                     grp,
@@ -1063,6 +1113,12 @@ async function handleChatMember(update) {
             hourUTC:  new Date().getUTCHours(),
         });
 
+        // Signal: account metadata at join time (don't wait for a first message —
+        // ad-blast bots often join, lurk, and DM members without ever posting)
+        if (!isEstablishedMember(grp, user.id)) {
+            scoreUserMetadata(beh, user.id, user);
+        }
+
         // Signal: rejoining after leaving/being kicked
         // (skip for established baseline members — they may have left/rejoined legitimately)
         if (beh.joinCount > 1 && !isEstablishedMember(grp, user.id)) {
@@ -1127,27 +1183,15 @@ async function evaluateBehaviourScore(grp, user, beh) {
 
     if (beh.score >= BOT_BAN_SCORE && !beh.flagged) {
         beh.flagged = true;
-        const reason = `Bot behaviour score ${beh.score}/6+:\n${beh.scoreReasons.join('\n')}`;
+        const reason = `Bot behaviour score ${beh.score}/${BOT_BAN_SCORE}: ${beh.scoreReasons.join('; ')}`;
         log('ALERT', `[${grp.name}] Bot detected: ${user.id} (${name}) score=${beh.score}`, { reasons: beh.scoreReasons });
-
-        if (grp.dryRun) {
-            log('DRY-RUN', `[${grp.name}] Would ban bot ${user.id}`, { reason });
-            appendBanLog(grp, { userId: user.id, username, reason, trigger: 'bot-behaviour', dry_run: true });
-            return;
-        }
-        try {
-            await tgApi('banChatMember', { chat_id: grp.id, user_id: user.id });
-            const alert =
-                `🤖 *Bot account banned* (${grp.name})\n\n` +
-                `👤 ${username ? '@' + username : name} (ID: \`${user.id}\`)\n` +
-                `📊 Score: ${beh.score}\n` +
-                `📋 ${beh.scoreReasons.slice(0, 4).join('\n')}\n` +
-                `🤖 Trigger: bot-behaviour`;
-            await tgApi('sendMessage', { chat_id: grp.alertChat, text: alert, parse_mode: 'Markdown' });
-            appendBanLog(grp, { userId: user.id, username, reason, score: beh.score, trigger: 'bot-behaviour' });
-        } catch (e) {
-            log('ERROR', `[${grp.name}] Bot ban failed`, { userId: user.id, err: e.message });
-        }
+        logEvent(grp, 'detection', {
+            userId: user.id, username: username || null,
+            detector: 'bot-behaviour', score: beh.score,
+            reasons: beh.scoreReasons,
+        });
+        // banUser handles dry-run, prediction logging, ban-log, and the alert
+        await banUser(grp, user.id, username, reason, 'bot-behaviour', beh.score, beh.scoreReasons);
 
     } else if (beh.score >= BOT_ALERT_SCORE && !beh.warned) {
         beh.warned = true;
@@ -1481,6 +1525,7 @@ async function main() {
     for (let attempt = 1; attempt <= 5; attempt++) {
         try {
             me = await tgApi('getMe');
+            BOT_ID = me.id;
             log('INFO', `Bot: @${me.username} (${me.id})`);
             break;
         } catch (e) {

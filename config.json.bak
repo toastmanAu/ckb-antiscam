@@ -6,7 +6,7 @@
       "id": "-1001044500844",
       "name": "Nervos Nation",
       "alert_chat": "-1001044500844",
-      "dry_run": true
+      "dry_run": false
     },
     {
       "id": "-1001338982855",
@@ -32,5 +32,6 @@
   "name_dist_threshold": 2,
   "photo_hash_threshold": 10,
   "warn_first": true,
-  "dry_run": true
+  "dry_run": true,
+  "learn_mode": true
 }

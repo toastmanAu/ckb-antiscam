@@ -90,6 +90,31 @@ systemctl --user status ckb-antiscam
 **Lower = stricter.** If you get false positives, increase thresholds.
 If scammers are slipping through, decrease them.
 
+## Watch mode vs enforce mode
+
+Each group in `config.json` has a `dry_run` flag:
+
+- `"dry_run": true` — **watch mode**: detections are logged and alerted, but nothing is deleted or banned
+- `"dry_run": false` — **enforce mode**: the bot deletes and bans on detection
+
+The top-level `dry_run` is the default for groups that don't set their own.
+Flip a group to enforce by setting its `dry_run` to `false` and restarting (`bash start.sh`).
+
+With `"learn_mode": true`, every bot decision is logged to `data/<groupId>/predictions.jsonl`
+and reconciled against observed admin actions:
+
+- Admin bans someone the bot flagged → TRUE_POSITIVE
+- Admin bans someone the bot missed → FALSE_NEGATIVE
+- Dry-run flag with no admin follow-up within 48h → FALSE_POSITIVE
+- In enforce mode, a bot ban that no admin reverses within 48h → TRUE_POSITIVE; an admin **unban** of a bot ban → FALSE_POSITIVE
+
+Check hit rate any time with:
+
+```bash
+node calibrate.js --days 14
+node daily-summary.js --days 1
+```
+
 ## How photo detection works
 
 1. On startup, bot downloads each mod's current profile photo

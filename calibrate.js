@@ -17,8 +17,8 @@ const path = require('path');
 
 const config = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'));
 const args   = process.argv.slice(2);
-const DAYS   = parseInt(args[args.indexOf('--days') + 1] || '14', 10);
-const FILTER_GROUP = args[args.indexOf('--group') + 1] || null;
+const DAYS   = args.includes('--days')  ? parseInt(args[args.indexOf('--days') + 1], 10) : 14;
+const FILTER_GROUP = args.includes('--group') ? args[args.indexOf('--group') + 1] : null;
 const cutoff = Date.now() - DAYS * 24 * 3600 * 1000;
 
 // ── Load all predictions ──────────────────────────────────────────────────────
@@ -26,7 +26,7 @@ const groups = [];
 for (const g of (config.groups || [])) {
     const name    = g.name || g.id;
     if (FILTER_GROUP && name !== FILTER_GROUP) continue;
-    const dataDir = path.join(__dirname, 'data', String(g.id));
+    const dataDir = path.join(__dirname, 'data', String(g.id).replace(/^-/, ''));
     const predFile = path.join(dataDir, 'predictions.jsonl');
     const adminFile = path.join(dataDir, 'admin-actions.jsonl');
 
