@@ -22,7 +22,9 @@ const https = require('https');
 
 const config = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'));
 const args   = process.argv.slice(2);
-const DAYS   = parseInt(args[args.indexOf('--days') + 1] || '1', 10);
+const daysIdx = args.indexOf('--days');
+const DAYS   = (daysIdx >= 0 && /^\d+$/.test(args[daysIdx + 1] || ''))
+             ? parseInt(args[daysIdx + 1], 10) : 1;
 const NOTIFY = args.includes('--notify');
 const SAVE   = args.includes('--save');
 const now    = Date.now();
