@@ -881,7 +881,7 @@ function scoreBehaviourOnMessage(userId, msg) {
     if (beh.msgCount === 1) { // only check once per user
         // No username (anonymous-ish account)
         if (!from.username) {
-            addScore(beh, 1, 'No username set');
+            addScore(beh, 2, 'No username set');
         }
         // Language code mismatch — account says non-English but name is English
         const lang = from.language_code || '';
@@ -894,7 +894,7 @@ function scoreBehaviourOnMessage(userId, msg) {
         // Very new account (Telegram user IDs are roughly sequential/chronological)
         // IDs above ~7.5B were registered after ~2024, common for bot farms
         if (userId > 7_500_000_000) {
-            addScore(beh, 1, `Very new account (user_id=${userId})`);
+            addScore(beh, 2, `Very new account (user_id=${userId})`);
         }
     }
 
@@ -1102,12 +1102,12 @@ async function handleChatMember(update) {
 
         // Signal: left very quickly without posting
         if (timeInGroup !== null && timeInGroup < 3 * 60_000 && beh.msgCount === 0) {
-            addScore(beh, 2, `Left without posting after ${Math.round(timeInGroup/1000)}s — lurk-bot`);
+            addScore(beh, 3, `Left without posting after ${Math.round(timeInGroup/1000)}s — lurk-bot`);
         }
 
         // Signal: repeated join/leave cycle
         if (beh.joinCount >= 2 && beh.leaveCount >= 2) {
-            addScore(beh, 3, `Join/leave cycling: ${beh.joinCount} joins, ${beh.leaveCount} leaves`);
+            addScore(beh, 4, `Join/leave cycling: ${beh.joinCount} joins, ${beh.leaveCount} leaves`);
         }
 
         log('INFO', `Member left: ${user.first_name} (@${user.username}) [${user.id}] score=${beh.score}`);
@@ -1432,7 +1432,14 @@ async function poll() {
             const grp    = getGroup(chatId);
 
             if (!grp) {
-                // Not one of our monitored groups — only handle private /commands from mods
+                // Not one of our monitored groups — log first time we see this chat id
+                if (!global.__seenUnknownChats) global.__seenUnknownChats = new Set();
+                if (!global.__seenUnknownChats.has(chatId)) {
+                    global.__seenUnknownChats.add(chatId);
+                    log('INFO', `Unknown chat seen: id=${chatId} title="${msg.chat.title || ''}" type=${msg.chat.type}`);
+                }
+
+                // Only handle private /commands from mods
                 if (msg.text && msg.text.startsWith('/') && confirmedMods.has(msg.from?.id)) {
                     await handleCommand(msg);
                 }
